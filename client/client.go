@@ -21,12 +21,48 @@ type Client struct {
 	net, addr    string
 	innerHandler *responseHandlerMap
 	in           chan *Response
-	conn         net.Conn
-	rw           *bufio.ReadWriter
+
+	// connMu guards the conn/rw pointers below, and nothing else.
+	//
+	// Deliberately not the embedded Mutex: do() holds that one until the
+	// ResponseTimeout while waiting for a response, and that response only
+	// arrives if readLoop keeps reading in the meantime. Were readLoop to need
+	// the embedded Mutex, every Do would time out.
+	//
+	// The lock is never held across blocking I/O: read() and write() take a
+	// single snapshot of rw and operate outside the lock.
+	connMu sync.RWMutex
+	conn   net.Conn
+	rw     *bufio.ReadWriter
 
 	ResponseTimeout time.Duration // response timeout for do()
 
 	ErrorHandler ErrorHandler
+}
+
+// getConn returns the current connection, or nil after Close().
+func (client *Client) getConn() net.Conn {
+	client.connMu.RLock()
+	defer client.connMu.RUnlock()
+	return client.conn
+}
+
+// getRW returns the current buffered reader/writer. Callers do their I/O on
+// the returned value rather than on client.rw, which keeps the lock out of the
+// blocking read or write.
+func (client *Client) getRW() *bufio.ReadWriter {
+	client.connMu.RLock()
+	defer client.connMu.RUnlock()
+	return client.rw
+}
+
+// setConn swaps connection and reader/writer in one step, so no observer can
+// ever see an rw that belongs to a different conn.
+func (client *Client) setConn(conn net.Conn, rw *bufio.ReadWriter) {
+	client.connMu.Lock()
+	defer client.connMu.Unlock()
+	client.conn = conn
+	client.rw = rw
 }
 
 type responseHandlerMap struct {
@@ -76,35 +112,43 @@ func New(network, addr string) (client *Client, err error) {
 		in:              make(chan *Response, queueSize),
 		ResponseTimeout: DefaultTimeout,
 	}
-	client.conn, err = net.Dial(client.net, client.addr)
+	conn, err := net.Dial(client.net, client.addr)
 	if err != nil {
 		return
 	}
-	client.rw = bufio.NewReadWriter(bufio.NewReader(client.conn),
-		bufio.NewWriter(client.conn))
+	client.setConn(conn, bufio.NewReadWriter(bufio.NewReader(conn),
+		bufio.NewWriter(conn)))
 	go client.readLoop()
 	go client.processLoop()
 	return
 }
 
 func (client *Client) write(req *request) (err error) {
+	rw := client.getRW()
+	if rw == nil {
+		return ErrLostConn
+	}
 	var n int
 	buf := req.Encode()
 	for i := 0; i < len(buf); i += n {
-		n, err = client.rw.Write(buf[i:])
+		n, err = rw.Write(buf[i:])
 		if err != nil {
 			return
 		}
 	}
-	return client.rw.Flush()
+	return rw.Flush()
 }
 
 func (client *Client) read(length int) (data []byte, err error) {
 	n := 0
+	rw := client.getRW()
+	if rw == nil {
+		return nil, ErrLostConn
+	}
 	buf := getBuffer(bufferSize)
 	// read until data can be unpacked
 	for i := length; i > 0 || len(data) < minPacketLength; i -= n {
-		if n, err = client.rw.Read(buf); err != nil {
+		if n, err = rw.Read(buf); err != nil {
 			return
 		}
 		data = append(data, buf[0:n]...)
@@ -121,7 +165,7 @@ func (client *Client) readLoop() {
 	var err error
 	var resp *Response
 ReadLoop:
-	for client.conn != nil {
+	for client.getConn() != nil {
 		if data, err = client.read(bufferSize); err != nil {
 			if opErr, ok := err.(*net.OpError); ok {
 				if opErr.Timeout() {
@@ -137,13 +181,14 @@ ReadLoop:
 			// closed by Gearmand, the client should close the conection
 			// and reconnect to job server.
 			client.Close()
-			client.conn, err = net.Dial(client.net, client.addr)
+			var conn net.Conn
+			conn, err = net.Dial(client.net, client.addr)
 			if err != nil {
 				client.err(err)
 				break
 			}
-			client.rw = bufio.NewReadWriter(bufio.NewReader(client.conn),
-				bufio.NewWriter(client.conn))
+			client.setConn(conn, bufio.NewReadWriter(bufio.NewReader(conn),
+				bufio.NewWriter(conn)))
 			continue
 		}
 		if len(leftdata) > 0 { // some data left for processing
@@ -221,7 +266,7 @@ func (client *Client) do(funcname string, data []byte,
 	if len(id) == 0 {
 		return "", ErrInvalidId
 	}
-	if client.conn == nil {
+	if client.getConn() == nil {
 		return "", ErrLostConn
 	}
 	var result = make(chan handleOrError, 1)
@@ -271,7 +316,7 @@ func (client *Client) DoBg(funcname string, data []byte,
 
 // Status gets job status from job server.
 func (client *Client) Status(handle string) (status *Status, err error) {
-	if client.conn == nil {
+	if client.getConn() == nil {
 		return nil, ErrLostConn
 	}
 	var mutex sync.Mutex
@@ -294,7 +339,7 @@ func (client *Client) Status(handle string) (status *Status, err error) {
 
 // Echo.
 func (client *Client) Echo(data []byte) (echo []byte, err error) {
-	if client.conn == nil {
+	if client.getConn() == nil {
 		return nil, ErrLostConn
 	}
 	var mutex sync.Mutex
@@ -315,9 +360,12 @@ func (client *Client) Echo(data []byte) (echo []byte, err error) {
 func (client *Client) Close() (err error) {
 	client.Lock()
 	defer client.Unlock()
+	client.connMu.Lock()
+	defer client.connMu.Unlock()
 	if client.conn != nil {
 		err = client.conn.Close()
 		client.conn = nil
+		client.rw = nil
 	}
 	return
 }
@@ -343,7 +391,7 @@ func (client *Client) DoWithId(funcname string, data []byte,
 // flag can be set to: JobLow, JobNormal and JobHigh
 func (client *Client) DoBgWithId(funcname string, data []byte,
 	flag byte, id string) (handle string, err error) {
-	if client.conn == nil {
+	if client.getConn() == nil {
 		return "", ErrLostConn
 	}
 	var datatype uint32
