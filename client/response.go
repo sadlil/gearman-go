@@ -17,15 +17,23 @@ type Response struct {
 	Handle    string
 }
 
-// Extract the Response's result.
-// if data == nil, err != nil, then worker failing to execute job
-// if data != nil, err != nil, then worker has a exception
-// if data != nil, err == nil, then worker complate job
-// after calling this method, the Response.Handle will be filled
+// Result extracts the outcome of a terminal response:
+//
+//	WORK_COMPLETE:  data = the job's result,           err = nil
+//	WORK_FAIL:      data = nil,                        err = ErrWorkFail
+//	WORK_EXCEPTION: data = the worker's exception payload (non-nil, possibly
+//	                empty),                            err = ErrWorkException
+//
+// Any other DataType yields ErrDataType. Response.Handle was already filled in
+// when the packet was decoded and is left untouched.
+//
+// A WORK_EXCEPTION only reaches the client when the "exceptions" option was
+// negotiated on the connection; see DefaultExceptions. Without it the job
+// server downgrades the worker's exception to a WORK_FAIL, so the same failure
+// arrives as ErrWorkFail with no payload.
 func (resp *Response) Result() (data []byte, err error) {
 	switch resp.DataType {
 	case dtWorkFail:
-		resp.Handle = string(resp.Data)
 		err = ErrWorkFail
 		return
 	case dtWorkException:
@@ -93,8 +101,10 @@ func decodeResponse(data []byte) (resp *Response, l int, err error) {
 			err = fmt.Errorf("Invalid data: %v", data)
 			return
 		}
-	case dtEchoRes:
-		fallthrough
+	case dtEchoRes, dtOptionRes:
+		// Both carry a single opaque argument and no job handle: the echoed
+		// payload, respectively the name of the option that was set.
+		resp.Data = dt
 	default:
 		resp.Data = dt
 	}

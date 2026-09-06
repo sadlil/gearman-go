@@ -38,6 +38,8 @@ const (
 	dtCanDoTimeout   = 23
 	dtAllYours       = 24
 	dtWorkException  = 25
+	dtOptionReq      = 26
+	dtOptionRes      = 27
 	dtWorkData       = 28
 	dtWorkWarning    = 29
 	dtGrabJobUniq    = 30
@@ -58,6 +60,20 @@ const (
 	WorkFail      = dtWorkFail
 	WorkException = dtWorkException
 )
+
+// optionExceptions is the only option name gearmand accepts in an OPTION_REQ.
+// Setting it makes the job server forward a worker's WORK_EXCEPTION packet to
+// this connection; without it the server rewrites that packet into a bare
+// WORK_FAIL and the worker's payload is lost.
+const optionExceptions = "exceptions"
+
+// dtOptionSent is not a protocol packet type and never travels over the wire.
+// connect() pushes a Response carrying it into client.in to tell processLoop
+// that a fresh connection was opened with an OPTION_REQ on it, so the next
+// packet to arrive is the server's answer to that request. The value sits
+// outside the range gearmand uses for real packet types, so it can never
+// collide with a decoded one.
+const dtOptionSent uint32 = 1 << 31
 
 const (
 	// Job type

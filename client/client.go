@@ -6,11 +6,32 @@ import (
 	"bufio"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 var (
 	DefaultTimeout time.Duration = time.Second
+
+	// DefaultExceptions controls whether a client asks the job server for the
+	// "exceptions" option on every connection it opens, both the initial one
+	// and every reconnect.
+	//
+	// With the option on, a worker that fails with a payload is delivered as a
+	// WORK_EXCEPTION carrying that payload. With it off, gearmand rewrites the
+	// very same event into a WORK_FAIL and throws the payload away, which is
+	// why this defaults to true.
+	//
+	// Set it to false before calling New() to keep the old behaviour; it is
+	// read once, in New(), and applies process-wide.
+	DefaultExceptions = true
+)
+
+// Negotiation state of the "exceptions" option, held in Client.exceptionsState.
+const (
+	exceptionsPending int32 = iota // not negotiated yet, or not requested at all
+	exceptionsOn                   // the job server acknowledged the option
+	exceptionsRefused              // the job server did not take the option
 )
 
 // One client connect to one server.
@@ -35,9 +56,30 @@ type Client struct {
 	conn   net.Conn
 	rw     *bufio.ReadWriter
 
+	// wantExceptions is a copy of DefaultExceptions taken in New(). It is never
+	// written again, so connect() may read it from readLoop's goroutine without
+	// a lock. Not guarded by connMu, which covers conn/rw and nothing else.
+	wantExceptions bool
+	// exceptionsState is one of the exceptions* constants. processLoop writes
+	// it, ExceptionsEnabled() reads it from the caller's goroutine, hence
+	// atomic. Also not guarded by connMu.
+	exceptionsState int32
+
 	ResponseTimeout time.Duration // response timeout for do()
 
 	ErrorHandler ErrorHandler
+}
+
+// ExceptionsEnabled reports whether the job server acknowledged the
+// "exceptions" option on the current connection, and therefore whether a
+// worker's exception will arrive as a WORK_EXCEPTION with its payload rather
+// than as a bare WORK_FAIL.
+//
+// It is false while the handshake is still in flight, when DefaultExceptions
+// was false when the client was created, and when the server refused or
+// ignored the option.
+func (client *Client) ExceptionsEnabled() bool {
+	return atomic.LoadInt32(&client.exceptionsState) == exceptionsOn
 }
 
 // getConn returns the current connection, or nil after Close().
@@ -110,16 +152,50 @@ func New(network, addr string) (client *Client, err error) {
 		addr:            addr,
 		innerHandler:    newResponseHandlerMap(),
 		in:              make(chan *Response, queueSize),
+		wantExceptions:  DefaultExceptions,
 		ResponseTimeout: DefaultTimeout,
 	}
+	if err = client.connect(); err != nil {
+		return nil, err
+	}
+	go client.readLoop()
+	go client.processLoop()
+	return
+}
+
+// connect dials the job server and, when the client asks for it, negotiates the
+// "exceptions" option. It is the single place where a connection is
+// established, so the initial dial in New() and the redial in readLoop() cannot
+// drift apart -- the job server keeps the option per connection, so it has to
+// be requested again on every reconnect or it silently disappears.
+//
+// The OPTION_REQ is written to rw *before* setConn publishes it. That is what
+// makes it the first packet on the wire: no other goroutine can reach this rw
+// yet, so no SUBMIT_JOB can overtake it and no concurrent write can interleave
+// with its bytes. Do not move this write after setConn.
+func (client *Client) connect() (err error) {
 	conn, err := net.Dial(client.net, client.addr)
 	if err != nil {
 		return
 	}
-	client.setConn(conn, bufio.NewReadWriter(bufio.NewReader(conn),
-		bufio.NewWriter(conn)))
-	go client.readLoop()
-	go client.processLoop()
+	rw := bufio.NewReadWriter(bufio.NewReader(conn), bufio.NewWriter(conn))
+	if client.wantExceptions {
+		if err = writeTo(rw, getOptionReq(optionExceptions)); err != nil {
+			conn.Close()
+			return
+		}
+		atomic.StoreInt32(&client.exceptionsState, exceptionsPending)
+	}
+	client.setConn(conn, rw)
+	if client.wantExceptions {
+		// Tell processLoop that the next packet it sees is the answer to the
+		// OPTION_REQ above. client.in is buffered and the only other sender is
+		// readLoop, which is either not running yet (New) or is the goroutine
+		// executing this very call (redial), so this cannot block behind
+		// another packet and it lands after everything from the old
+		// connection.
+		client.in <- &Response{DataType: dtOptionSent}
+	}
 	return
 }
 
@@ -128,6 +204,13 @@ func (client *Client) write(req *request) (err error) {
 	if rw == nil {
 		return ErrLostConn
 	}
+	return writeTo(rw, req)
+}
+
+// writeTo encodes and flushes a request onto rw. It takes the reader/writer as
+// an argument so connect() can use it on a connection that is not published
+// yet.
+func writeTo(rw *bufio.ReadWriter, req *request) (err error) {
 	var n int
 	buf := req.Encode()
 	for i := 0; i < len(buf); i += n {
@@ -179,16 +262,18 @@ ReadLoop:
 			client.err(err)
 			// If it is unexpected error and the connection wasn't
 			// closed by Gearmand, the client should close the conection
-			// and reconnect to job server.
+			// and reconnect to job server. connect() re-negotiates the
+			// "exceptions" option, which the server holds per connection.
 			client.Close()
-			var conn net.Conn
-			conn, err = net.Dial(client.net, client.addr)
-			if err != nil {
+			if err = client.connect(); err != nil {
 				client.err(err)
 				break
 			}
-			client.setConn(conn, bufio.NewReadWriter(bufio.NewReader(conn),
-				bufio.NewWriter(conn)))
+			// Whatever was left half-parsed belongs to the connection that
+			// just died. Keeping it would prepend stale bytes to the first
+			// packet of the new one -- which is now the answer to the
+			// OPTION_REQ.
+			leftdata = nil
 			continue
 		}
 		if len(leftdata) > 0 { // some data left for processing
@@ -218,10 +303,43 @@ ReadLoop:
 
 func (client *Client) processLoop() {
 	rhandlers := map[string]ResponseHandler{}
+	// optionPending is true between the marker connect() pushes and the first
+	// packet that arrives on the new connection. Only this goroutine touches
+	// it, like rhandlers.
+	optionPending := false
 	for resp := range client.in {
+		if resp.DataType == dtOptionSent {
+			optionPending = true
+			continue
+		}
+		if optionPending {
+			optionPending = false
+			if resp.DataType == dtOptionRes {
+				atomic.StoreInt32(&client.exceptionsState, exceptionsOn)
+				continue
+			}
+			// The OPTION_REQ was the first packet on this connection (see
+			// connect), so the first reply answers it. Anything other than
+			// OPTION_RES means the server did not take the option: fall back
+			// to WORK_FAIL semantics for this connection.
+			atomic.StoreInt32(&client.exceptionsState, exceptionsRefused)
+			if resp.DataType == dtError {
+				// This ERROR *is* that refusal, not a fault in the caller's
+				// job. Swallowing it keeps a server that does not know the
+				// option from firing the user's ErrorHandler for something
+				// they cannot act on. ERROR packets that are not this reply
+				// still reach the handler below.
+				continue
+			}
+			// A server that ignored the OPTION_REQ outright: this packet
+			// belongs to a later request, so let it fall through and be
+			// handled normally.
+		}
 		switch resp.DataType {
 		case dtError:
 			client.err(getError(resp.Data))
+		case dtOptionRes:
+			// A late or repeated acknowledgement. The state is already set.
 		case dtStatusRes:
 			client.handleInner("s"+resp.Handle, resp, nil)
 		case dtJobCreated:

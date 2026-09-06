@@ -35,10 +35,13 @@ func main() {
 		case client.WorkFail:
 			fallthrough
 		case client.WorkComplate:
+			// A WORK_EXCEPTION carries both an error and the payload the
+			// worker sent with it, so log the data as well -- dropping it on
+			// err != nil throws away the whole point of the exception.
 			if data, err := resp.Result(); err == nil {
 				log.Printf("RESULT: %v\n", data)
 			} else {
-				log.Printf("RESULT: %s\n", err)
+				log.Printf("RESULT: %s, %v\n", err, data)
 			}
 		case client.WorkWarning:
 			fallthrough

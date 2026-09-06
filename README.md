@@ -78,6 +78,65 @@ handle, err := c.Do("ToUpper", echo, client.JobNormal, jobHandler)
 // ...	
 ```
 
+## Worker exceptions
+
+A worker that fails *and* returns data raises a Gearman exception. The job
+server only forwards those to a client that asked for them, by sending an
+`OPTION_REQ exceptions` on the connection; without it gearmand rewrites the
+exception into a plain `WORK_FAIL` and throws the worker's payload away.
+
+The client requests that option by default, on the initial connection and on
+every reconnect, so a worker exception arrives intact:
+
+```go
+jobHandler := func(resp *client.Response) {
+	switch resp.DataType {
+	case client.WorkComplete:
+		data, _ := resp.Result()
+		log.Printf("done: %s", data)
+	case client.WorkException:
+		// err is client.ErrWorkException; data is the worker's payload.
+		data, err := resp.Result()
+		log.Printf("exception: %s (%v)", data, err)
+	case client.WorkFail:
+		log.Printf("failed without a payload")
+	}
+}
+```
+
+`WORK_EXCEPTION` is terminal: the job is finished and no `WORK_FAIL` or
+`WORK_COMPLETE` follows it.
+
+### Upgrading
+
+Before this option existed, a worker exception reached the client as a
+`WORK_FAIL`. It now arrives as a `WORK_EXCEPTION` instead:
+
+| | before | now |
+|---|---|---|
+| `resp.DataType` | `client.WorkFail` | `client.WorkException` |
+| `resp.Data` | `nil` | the worker's payload |
+| `resp.Result()` | `nil, ErrWorkFail` | `payload, ErrWorkException` |
+
+So check your job handlers for two things: a `switch resp.DataType` without a
+`case client.WorkException` now drops those responses silently, and retry logic
+keyed on `err == client.ErrWorkFail` no longer fires for exceptions.
+
+To keep the old behaviour, opt out before creating any client:
+
+```go
+client.DefaultExceptions = false
+```
+
+`(*Client).ExceptionsEnabled()` reports whether the job server actually
+acknowledged the option. A server that refuses or ignores it is not an error:
+the client degrades to the old `WORK_FAIL` behaviour and stays usable.
+
+Note the worker side of this: `gearman-go` sends a `WORK_EXCEPTION` only when
+the job function returns a non-empty `data` *and* an error. `return nil, err`
+still produces a `WORK_FAIL`, and the text of `err` never goes over the wire —
+put anything the client needs to see in `data`.
+
 Branches
 ========
 

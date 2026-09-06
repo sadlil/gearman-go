@@ -7,10 +7,16 @@ import (
 )
 
 var (
-	ErrWorkWarning   = errors.New("Work warning")
-	ErrInvalidData   = errors.New("Invalid data")
-	ErrInvalidId     = errors.New("Invalid ID")
-	ErrWorkFail      = errors.New("Work fail")
+	ErrWorkWarning = errors.New("Work warning")
+	ErrInvalidData = errors.New("Invalid data")
+	ErrInvalidId   = errors.New("Invalid ID")
+	// ErrWorkFail is returned by Response.Result for a WORK_FAIL: the job
+	// failed and the worker sent no payload with it.
+	ErrWorkFail = errors.New("Work fail")
+	// ErrWorkException is returned by Response.Result for a WORK_EXCEPTION.
+	// The worker's exception payload is the data return value; the error only
+	// says that the job ended in an exception. Reaching a client at all
+	// requires the "exceptions" option, see DefaultExceptions.
 	ErrWorkException = errors.New("Work exeption")
 	ErrDataType      = errors.New("Invalid data type")
 	ErrLostConn      = errors.New("Lost connection with Gearmand")

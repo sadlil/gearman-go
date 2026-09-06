@@ -91,27 +91,31 @@ func (pool *Pool) Remove(addr string) {
 	delete(pool.Clients, addr)
 }
 
+// Do submits a job. It deliberately does not lock the client: (*Client).do
+// takes the client's mutex itself and holds it until the job server answers,
+// and sync.Mutex is not reentrant, so locking here as well would hang forever.
+// Contrast with Status and Echo below.
 func (pool *Pool) Do(funcname string, data []byte,
 	flag byte, h ResponseHandler) (addr, handle string, err error) {
 	client := pool.selectServer()
-	client.Lock()
-	defer client.Unlock()
 	handle, err = client.Do(funcname, data, flag, h)
 	addr = client.addr
 	return
 }
 
+// DoBg submits a background job. See the note on Do about locking.
 func (pool *Pool) DoBg(funcname string, data []byte,
 	flag byte) (addr, handle string, err error) {
 	client := pool.selectServer()
-	client.Lock()
-	defer client.Unlock()
 	handle, err = client.DoBg(funcname, data, flag)
 	addr = client.addr
 	return
 }
 
 // Status gets job status from job server.
+// Unlike Do, this does take the client's mutex: (*Client).Status writes to the
+// connection without holding it, so this is the only thing keeping concurrent
+// callers from interleaving their bytes on the shared writer.
 // !!!Not fully tested.!!!
 func (pool *Pool) Status(addr, handle string) (status *Status, err error) {
 	if client, ok := pool.Clients[addr]; ok {
@@ -125,6 +129,7 @@ func (pool *Pool) Status(addr, handle string) (status *Status, err error) {
 }
 
 // Send a something out, get the samething back.
+// Takes the client's mutex for the same reason as Status, not Do.
 func (pool *Pool) Echo(addr string, data []byte) (echo []byte, err error) {
 	var client *PoolClient
 	if addr == "" {

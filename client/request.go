@@ -28,6 +28,15 @@ func getRequest() (req *request) {
 	return
 }
 
+// getOptionReq builds an OPTION_REQ for the named option. The protocol takes
+// the bare name as the only argument, with no trailing NULL byte.
+func getOptionReq(name string) (req *request) {
+	req = getRequest()
+	req.DataType = dtOptionReq
+	req.Data = []byte(name)
+	return
+}
+
 func getJob(id string, funcname, data []byte) (req *request) {
 	req = getRequest()
 	a := len(funcname)
